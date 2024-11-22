@@ -119,6 +119,8 @@ from .models import (
     GaudiQwen2MoeForCausalLM,
     GaudiQwen2MoeMLP,
     GaudiQwen2MoeModel,
+    GaudiQwen2VLModel,
+    GaudiQwen2VLForConditionalGeneration,
     GaudiStableLmAttention,
     GaudiStableLmDecoderLayer,
     GaudiStableLmForCausalLM,
@@ -593,6 +595,12 @@ def adapt_transformers_to_gaudi():
     transformers.models.qwen2_moe.modeling_qwen2_moe.Qwen2MoeRMSNorm.forward = gaudi_qwen2moe_rmsnorm_forward
     transformers.models.qwen2_moe.modeling_qwen2_moe.Qwen2MoeSparseMoeBlock.forward = (
         gaudi_qwen2moe_block_sparse_moe_forward
+    )
+
+    # Optimization for qwen2-vl Gaudi
+    transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLModel = GaudiQwen2VLModel
+    transformers.models.qwen2_vl.modeling_qwen2_vl.Qwen2VLForConditionalGeneration = (
+        GaudiQwen2VLForConditionalGeneration
     )
 
     # Optimization for stablelm on Gaudi

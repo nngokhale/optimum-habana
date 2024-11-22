@@ -210,6 +210,10 @@ from .qwen2_moe import (
     gaudi_qwen2moe_block_sparse_moe_forward,
     gaudi_qwen2moe_rmsnorm_forward,
 )
+from .qwen2_vl import (
+    GaudiQwen2VLModel,
+    GaudiQwen2VLForConditionalGeneration,
+)
 from .seamless_m4t import (
     gaudi_SeamlessM4TAttention_forward,
     gaudi_SeamlessM4TCodeHifiGan_get_output_hifigan_lengths,
