@@ -211,6 +211,10 @@ from .qwen2_moe import (
     gaudi_qwen2moe_rmsnorm_forward,
 )
 from .qwen2_vl import (
+    GaudiVisionSdpaAttention,
+    GaudiQwen2VLVisionBlock,
+    GaudiQwen2VLSdpaAttention,
+    GaudiQwen2VLDecoderLayer,
     GaudiQwen2VLModel,
     GaudiQwen2VLForConditionalGeneration,
 )

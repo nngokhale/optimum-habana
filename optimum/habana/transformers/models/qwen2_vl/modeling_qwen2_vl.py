@@ -15,7 +15,7 @@
 """PyTorch Gaudi Qwen2-VL model."""
 debug_log = False
 from typing import List, Optional, Tuple, Union
-
+import warnings
 import torch
 from transformers.modeling_outputs import (
     BaseModelOutputWithPast,
@@ -29,7 +29,23 @@ def get_recompilations():
     htcore.mark_step(sync=True)
     return recomps
 
+import torch.nn.functional as F
+import torch.nn as nn
+from torch.nn import CrossEntropyLoss, LayerNorm
 from transformers.models.qwen2_vl.modeling_qwen2_vl import (
+    apply_rotary_pos_emb_vision,
+    VisionMlp,
+    VisionSdpaAttention,
+    VisionAttention,
+    VisionFlashAttention2,
+    Qwen2VLVisionBlock,
+    apply_multimodal_rotary_pos_emb,
+    repeat_kv,
+    Qwen2VLAttention,
+    Qwen2VLFlashAttention2,
+    Qwen2VLSdpaAttention,
+    Qwen2VLConfig,
+    Qwen2VLDecoderLayer,
     Qwen2VLModel,
     Qwen2VLForConditionalGeneration,
     Qwen2VLCausalLMOutputWithPast,
@@ -37,6 +53,13 @@ from transformers.models.qwen2_vl.modeling_qwen2_vl import (
 from transformers.utils import logging
 from transformers.cache_utils import Cache, SlidingWindowCache, StaticCache
 
+try:
+    from habana_frameworks.torch.hpex.kernels import FusedSDPA
+    print("Using HPU fused scaled dot-product attention kernel.")
+except ImportError:
+    print("Not using HPU fused scaled dot-product attention kernel.")
+    FusedSDPA = None
+#FusedSDPA = None
 logger = logging.get_logger(__name__)
 
 # from https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L439
@@ -92,6 +115,199 @@ def _prepare_4d_causal_attention_mask_with_cache_position(
             )
 
     return causal_mask
+
+
+# from: https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py
+class GaudiVisionSdpaAttention(VisionSdpaAttention):
+    def forward(
+        self, hidden_states: torch.Tensor, cu_seqlens: torch.Tensor, rotary_pos_emb: torch.Tensor = None
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        q = apply_rotary_pos_emb_vision(q.unsqueeze(0), rotary_pos_emb).squeeze(0)
+        k = apply_rotary_pos_emb_vision(k.unsqueeze(0), rotary_pos_emb).squeeze(0)
+
+        attention_mask = torch.zeros([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
+        if debug_log: print(attention_mask.size())
+        for i in range(1, len(cu_seqlens)):
+            if debug_log: print(cu_seqlens[i - 1], cu_seqlens[i])
+            attention_mask[:, cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = True
+        q = q.transpose(0, 1)
+        k = k.transpose(0, 1)
+        v = v.transpose(0, 1)
+        if FusedSDPA is not None:
+            if debug_log: print("Using FusedSDPA")
+            attn_output = FusedSDPA.apply(q, k, v, attention_mask, 0.0)
+        else:
+            attn_output = F.scaled_dot_product_attention(q, k, v, attention_mask, dropout_p=0.0)
+
+        attn_output = attn_output.transpose(0, 1)
+        attn_output = attn_output.reshape(seq_length, -1)
+        attn_output = self.proj(attn_output)
+        del attention_mask
+        return attn_output
+
+GAUDI_QWEN2_VL_VISION_ATTENTION_CLASSES = {
+    "eager": VisionAttention,
+    "flash_attention_2": VisionFlashAttention2,
+    "sdpa": GaudiVisionSdpaAttention,
+}
+
+
+class GaudiQwen2VLVisionBlock(nn.Module):
+    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+        super().__init__()
+        self.norm1 = LayerNorm(config.embed_dim, eps=1e-6)
+        self.norm2 = LayerNorm(config.embed_dim, eps=1e-6)
+        mlp_hidden_dim = int(config.embed_dim * config.mlp_ratio)
+
+        self.attn = GAUDI_QWEN2_VL_VISION_ATTENTION_CLASSES[attn_implementation](
+            config.embed_dim, num_heads=config.num_heads
+        )
+        self.mlp = VisionMlp(dim=config.embed_dim, hidden_dim=mlp_hidden_dim, hidden_act=config.hidden_act)
+
+    def forward(self, hidden_states, cu_seqlens, rotary_pos_emb) -> torch.Tensor:
+        hidden_states = hidden_states + self.attn(
+            self.norm1(hidden_states), cu_seqlens=cu_seqlens, rotary_pos_emb=rotary_pos_emb
+        )
+        hidden_states = hidden_states + self.mlp(self.norm2(hidden_states))
+        return hidden_states
+
+class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
+    """
+    Qwen2 attention module using torch.nn.functional.scaled_dot_product_attention. This module inherits from
+    `Qwen2Attention` as the weights of the module stays untouched. The only changes are on the forward pass to adapt to
+    SDPA API.
+    """
+
+    # Adapted from Qwen2Attention.forward
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Cache] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: Optional[torch.LongTensor] = None,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        if output_attentions:
+            # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
+            logger.warning_once(
+                "Qwen2VLModel is using Qwen2VLSdpaAttention, but `torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to the manual attention implementation, "
+                'but specifying the manual implementation will be required from Transformers version v5.0.0 onwards. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+            return super().forward(
+                hidden_states=hidden_states,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_value=past_key_value,
+                output_attentions=output_attentions,
+                use_cache=use_cache,
+                cache_position=cache_position,
+            )
+
+        bsz, q_len, _ = hidden_states.size()
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
+
+        kv_seq_len = key_states.shape[-2]
+        if past_key_value is not None:
+            kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
+        if position_embeddings is None:
+            logger.warning_once(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `position_ids` (2D tensor with the indexes of the tokens), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.46 `position_ids` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            cos, sin = self.rotary_emb(value_states, position_ids)
+        else:
+            cos, sin = position_embeddings
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
+        )
+
+        if past_key_value is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        causal_mask = attention_mask
+        if attention_mask is not None:  # no matter the length, we just slice it
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        # SDPA with memory-efficient backend is currently (torch==2.1.2) bugged with non-contiguous inputs with custom attn_mask,
+        # Reference: https://github.com/pytorch/pytorch/issues/112577.
+        if query_states.device.type == "cuda" and attention_mask is not None:
+            query_states = query_states.contiguous()
+            key_states = key_states.contiguous()
+            value_states = value_states.contiguous()
+
+        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
+        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
+        # The q_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create a causal mask in case q_len == 1.
+        is_causal = True if causal_mask is None and q_len > 1 else False
+
+        if FusedSDPA is not None:
+            input_dtype = query_states.dtype
+            # For accuracy
+            target_dtype = torch.float16
+            if input_dtype != target_dtype:
+                warnings.warn("FusedSDPA Type conversion for Accuracy")
+                query_states = query_states.to(target_dtype)
+                key_states = key_states.to(target_dtype)
+                value_states = value_states.to(target_dtype)
+            attn_output = FusedSDPA.apply(
+                query_states,
+                key_states,
+                value_states,
+                causal_mask,
+                self.attention_dropout if self.training else 0.0,
+                is_causal,
+                None, #scale
+                'None', #'fast'
+                False, #None, #recompute
+            )
+            if input_dtype != target_dtype:
+                attn_output = attn_output.to(input_dtype)
+        else:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                query_states,
+                key_states,
+                value_states,
+                attn_mask=causal_mask,
+                dropout_p=self.attention_dropout if self.training else 0.0,
+                is_causal=is_causal,
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.view(bsz, q_len, self.hidden_size)
+
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None, past_key_value
+
+
+
+GAUDI_QWEN2_VL_ATTENTION_CLASSES = {
+    "eager": Qwen2VLAttention,
+    "flash_attention_2": Qwen2VLFlashAttention2,
+    "sdpa": GaudiQwen2VLSdpaAttention,
+}
+
+class GaudiQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
+    def __init__(self, config: Qwen2VLConfig, layer_idx: int):
+        super().__init__(config, layer_idx)
+        self.self_attn = GAUDI_QWEN2_VL_ATTENTION_CLASSES[config._attn_implementation](config, layer_idx)
 
 class GaudiQwen2VLModel(Qwen2VLModel):
     def forward(
@@ -387,6 +603,8 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 if cache_position.shape[0] > 1:
                     input_ids = input_ids[:, :token_idx]
                     if debug_log: print(input_ids)
+                    attention_mask = attention_mask[:, :token_idx]
+                    if debug_log: print(attention_mask)
                     cache_position = cache_position[:token_idx]
                     if debug_log: print(cache_position)
                 else:
