@@ -299,6 +299,8 @@ def main():
             model = AutoModelForVision2Seq.from_pretrained(args.model_name_or_path, torch_dtype=model_dtype)
         if model_type == "mllama":
             model.language_model = initialize_distributed_model(args, model.language_model, logger, model_dtype)
+        elif model_type == "qwen2_vl":
+            model.model = initialize_distributed_model(args, model.model, logger, model_dtype)
         else:
             model = initialize_distributed_model(args, model, logger, model_dtype)
         generator = pipeline(

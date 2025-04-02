@@ -47,6 +47,12 @@ except ImportError:
     print("Not using HPU fused scaled dot-product attention kernel.")
     FusedSDPA = None
 
+try:
+    from deepspeed import comm as dist
+except ImportError:
+    print("No deepspeed.")
+    dist = None
+
 logger = logging.get_logger(__name__)
 
 
@@ -210,16 +216,13 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
                 use_cache=use_cache,
                 cache_position=cache_position,
             )
-
         bsz, q_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
-
         query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
         value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim).transpose(1, 2)
-
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value.get_usable_length(kv_seq_len, self.layer_idx)
@@ -233,13 +236,23 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
             cos, sin = self.rotary_emb(value_states, position_ids)
         else:
             cos, sin = position_embeddings
+
         query_states, key_states = apply_multimodal_rotary_pos_emb(
             query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
 
         if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}  # Specific to RoPE models
-            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            if isinstance(past_key_value, StaticCache) and dist and dist.is_initialized() and dist.get_world_size()>1:
+                k_out = past_key_value.key_cache[self.layer_idx]
+                v_out = past_key_value.value_cache[self.layer_idx]
+                rank = self.num_key_value_heads
+                k_out[:,:rank,cache_position] = key_states
+                v_out[:,:rank,cache_position] = value_states
+                key_states = k_out[:,0:rank,:,:]
+                value_states = v_out[:,0:rank,:,:]
+            else:
+                key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -280,10 +293,8 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
                 dropout_p=self.attention_dropout if self.training else 0.0,
                 is_causal=is_causal,
             )
-
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.view(bsz, q_len, self.hidden_size)
-
         attn_output = self.o_proj(attn_output)
 
         return attn_output, None, past_key_value
