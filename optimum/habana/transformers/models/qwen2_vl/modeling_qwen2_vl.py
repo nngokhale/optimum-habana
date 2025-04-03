@@ -188,12 +188,14 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
         cache_position: Optional[torch.LongTensor] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,  # will become mandatory in v4.46
         use_flash_attention: Optional[bool] = False,
+        flash_attention_fp32_softmax: Optional[bool] = False,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         """
         Copied from https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L829
         The only differences are:
         - add new args use_flash_attention
         - add FusedSDPA
+        - add new arg flash_attention_fp32_softmax
         """
         if output_attentions:
             # TODO: Improve this warning with e.g. `model.config.attn_implementation = "manual"` once this is implemented.
@@ -261,6 +263,7 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
         is_causal = True if causal_mask is None and q_len > 1 else False
 
         if FusedSDPA is not None and use_flash_attention:
+            softmax_mode = "fp32" if flash_attention_fp32_softmax else "None"
             attn_output = self.fused_scaled_dot_product_attention(
                 query_states,
                 key_states,
@@ -269,7 +272,7 @@ class GaudiQwen2VLSdpaAttention(Qwen2VLSdpaAttention):
                 self.attention_dropout if self.training else 0.0,
                 is_causal,
                 None,  # scale
-                "None",  #'fast'
+                softmax_mode,  #'fast', 'fp32'
             )
         else:
             attn_output = torch.nn.functional.scaled_dot_product_attention(
@@ -311,6 +314,7 @@ class GaudiQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
         Copied from https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L946
         The only differences are:
         - add new kwargs use_flash_attention
+        - add new kwargs flash_attention_fp32_softmax
         """
         """
         Args:
@@ -334,6 +338,7 @@ class GaudiQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
                 into the model
         """
         use_flash_attention = kwargs.get("use_flash_attention", None)
+        flash_attention_fp32_softmax = kwargs.get("flash_attention_fp32_softmax", None)
 
         residual = hidden_states
 
@@ -350,6 +355,7 @@ class GaudiQwen2VLDecoderLayer(Qwen2VLDecoderLayer):
             cache_position=cache_position,
             position_embeddings=position_embeddings,
             use_flash_attention=use_flash_attention,
+            flash_attention_fp32_softmax=flash_attention_fp32_softmax,
         )
         hidden_states = residual + hidden_states
 
@@ -385,12 +391,14 @@ class GaudiQwen2VLModel(Qwen2VLModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.LongTensor] = None,
         use_flash_attention: Optional[bool] = False,
+        flash_attention_fp32_softmax: Optional[bool] = False,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         """
         Copied from Qwen2VLModel https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1161
         The only differences are:
         - add new arg use_flash_attention
         - fixes graph recompilation due to torch.arange
+        - add new arg flash_attention_fp32_softmax
         """
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -467,6 +475,7 @@ class GaudiQwen2VLModel(Qwen2VLModel):
                     cache_position=cache_position,
                     position_embeddings=position_embeddings,
                     use_flash_attention=use_flash_attention,
+                    flash_attention_fp32_softmax=flash_attention_fp32_softmax,
                 )
 
             hidden_states = layer_outputs[0]
@@ -516,6 +525,7 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         rope_deltas: Optional[torch.LongTensor] = None,
         token_idx: Optional[torch.Tensor] = None,
         use_flash_attention: Optional[bool] = False,
+        flash_attention_fp32_softmax: Optional[bool] = False,
     ) -> Union[Tuple, Qwen2VLCausalLMOutputWithPast]:
         """
         Copied from Qwen2VLForConditionalGeneration https://github.com/huggingface/transformers/blob/v4.45.2/src/transformers/models/qwen2_vl/modeling_qwen2_vl.py#L1623
@@ -523,6 +533,7 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         - add new arg token_idx
         - add new arg use_flash_attention
         - add Gaudi Example
+        - add new arg flash_attention_fp32_softmax
         """
         r"""
         Args:
@@ -614,6 +625,7 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             use_flash_attention=use_flash_attention,
+            flash_attention_fp32_softmax=flash_attention_fp32_softmax,
         )
 
         hidden_states = outputs[0]
@@ -666,9 +678,11 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
         The only differences are:
         - handle new args token_idx
         - handle new args use_flash_attention
+        - handle new args flash_attention_fp32_softmax
         """
         token_idx = kwargs.get("token_idx", None)
         use_flash_attention = kwargs.get("use_flash_attention", False)
+        flash_attention_fp32_softmax = kwargs.get("flash_attention_fp32_softmax", False)
         if token_idx is not None:
             if isinstance(past_key_values, StaticCache):
                 if cache_position.shape[0] > 1:
@@ -749,6 +763,7 @@ class GaudiQwen2VLForConditionalGeneration(Qwen2VLForConditionalGeneration):
                 "rope_deltas": rope_deltas,
                 "token_idx": token_idx,
                 "use_flash_attention": use_flash_attention,
+                "flash_attention_fp32_softmax": flash_attention_fp32_softmax,
             }
         )
 

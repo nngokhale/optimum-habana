@@ -1282,6 +1282,9 @@ class GaudiGenerationMixin(GenerationMixin):
         model_kwargs["flash_attention_fast_softmax"] = (
             True if generation_config.flash_attention_fast_softmax else False
         )
+        model_kwargs["flash_attention_fp32_softmax"] = (
+            True if generation_config.flash_attention_fp32_softmax else False
+        )
         model_kwargs["num_virtual_tokens"] = num_virtual_tokens
         if generation_config.valid_sequence_lengths is not None:
             model_kwargs["valid_sequence_lengths"] = generation_config.valid_sequence_lengths
